@@ -10,6 +10,7 @@ import os
 import re
 import urllib.request
 import urllib.error
+import subprocess
 import time
 import sys
 import types
@@ -4751,14 +4752,126 @@ class Plugin:
         now = timezone.now()
         return (now - measured).total_seconds() < ttl_minutes * 60
 
-    def _probe_stream_throughput(self, url, duration_s, user_agent, logger):
+    def _stream_profile_command(self, stream, channel_id, user_agent, logger):
+        """argv that writes this stream to stdout, or None for an ordinary URL.
+
+        Dispatcharr plays some channels by running a program rather than by
+        fetching a URL: the channel's stream profile holds that program, and
+        Stream.url is only a marker it understands. Distalker's MAG portals are
+        the case that surfaced this — their URLs use a .invalid host and never
+        resolve — and streamlink or yt-dlp profiles behave the same way. Opening
+        such a URL fails, the probe reports nothing, and every stream from that
+        provider lands in the "unknown throughput" tier below any provider that
+        could be measured.
+
+        Dispatcharr builds the argv itself (StreamProfile.build_command), which
+        is what keeps this generic: nothing here knows what those plugins are.
+        Any failure returns None, so a surprise costs the old behaviour rather
+        than the probe.
+        """
+        if not channel_id or not (stream.get('url') or '').strip():
+            return None
+        try:
+            channel = Channel.objects.filter(id=channel_id).first()
+            if channel is None:
+                return None
+            # Dispatcharr resolves the profile per CHANNEL, not per stream.
+            profile = channel.get_stream_profile()
+            if profile is None:
+                return None
+            # Proxy and Redirect are handled inside Dispatcharr: the first has
+            # no command to run, the second is a redirect urllib follows itself.
+            if callable(getattr(profile, 'is_proxy', None)) and profile.is_proxy():
+                return None
+            if callable(getattr(profile, 'is_redirect', None)) and profile.is_redirect():
+                return None
+            command = profile.build_command(stream['url'], user_agent, channel_id)
+            if not command or not command[0]:
+                return None
+            return command
+        except Exception as e:
+            logger.debug(
+                f"[Stream-Mapparr] Stream {stream.get('id')}: no command profile "
+                f"({type(e).__name__}: {e}); probing the URL directly"
+            )
+            return None
+
+    def _probe_command_throughput(self, source_command, duration_s, logger):
+        """Read a stream profile's program for `duration_s`, return (mbps, None).
+
+        The same measurement as the HTTP path — how fast the provider actually
+        delivers — taken one layer in, because these streams have no URL to
+        open. No edge host comes back: the connection is made inside the
+        program the profile runs, and it is not ours to inspect.
+        """
+        proc = None
+        watchdog = None
+        bytes_read = 0
+        start = time.time()
+        window = max(1.0, float(duration_s))
+        deadline = start + window
+        try:
+            proc = subprocess.Popen(
+                source_command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+            )
+            # A program that connects but never writes would block the read
+            # past the deadline, holding a provider connection with it.
+            watchdog = threading.Timer(window + 15, proc.kill)
+            watchdog.daemon = True
+            watchdog.start()
+            while time.time() < deadline:
+                chunk = proc.stdout.read(64 * 1024)
+                if not chunk:
+                    break
+                bytes_read += len(chunk)
+        except Exception as e:
+            logger.warning(
+                f"[Stream-Mapparr] Probe failed for {os.path.basename(source_command[0])}: "
+                f"{type(e).__name__}: {e}"
+            )
+            return None, None
+        finally:
+            if watchdog is not None:
+                watchdog.cancel()
+            if proc is not None:
+                try:
+                    if proc.stdout is not None:
+                        proc.stdout.close()
+                except Exception:
+                    pass
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait()
+
+        elapsed = max(0.001, time.time() - start)
+        # No bytes at all is not a measurement, however long it took: a program
+        # that connected and never wrote sits there until the watchdog kills it,
+        # and reporting 0 Mbps would rank that source as too slow rather than as
+        # unknown. The second clause is the HTTP path's own guard, for a program
+        # that gave up immediately after a token amount of data.
+        if bytes_read == 0 or (bytes_read < 64 * 1024 and elapsed < 1.0):
+            logger.warning(
+                f"[Stream-Mapparr] Probe yielded only {bytes_read} bytes in {elapsed:.2f}s "
+                f"through the channel's stream profile (provider refused, or the "
+                f"profile produced nothing)"
+            )
+            return None, None
+        return (bytes_read * 8) / (elapsed * 1_000_000.0), None
+
+    def _probe_stream_throughput(self, url, duration_s, user_agent, logger, source_command=None):
         """Open URL, read bytes for `duration_s` seconds, return (mbps, edge_ip).
 
         Returns (None, None) on failure. edge_ip is the host of the final URL after
         redirects — useful for diagnostics and dedup. We don't resolve it to an IP
         here to avoid an extra DNS round-trip; the host string is enough to spot
         per-edge throttling patterns when the same hostname resolves to one IP.
+
+        A stream whose channel plays through a command stream profile has no URL
+        to open; its bytes come from the profile's program instead.
         """
+        if source_command:
+            return self._probe_command_throughput(source_command, duration_s, logger)
+
         try:
             req = urllib.request.Request(url, headers={'User-Agent': user_agent or PluginConfig.DEFAULT_PROBE_USER_AGENT})
             # Open with a short connect timeout; the read loop enforces total duration.
@@ -9433,10 +9546,17 @@ class Plugin:
                     return {"status": "success", "message": "No enabled channels match selected groups."}
 
             # Pull every assigned stream once, with the fields we need.
-            stream_ids = list(
+            # The channel is kept, not just the stream id: a command stream
+            # profile is resolved per channel, and that is what says how this
+            # stream's bytes are obtained.
+            assignments = list(
                 ChannelStream.objects.filter(channel_id__in=channel_ids)
-                .values_list('stream_id', flat=True).distinct()
+                .values_list('stream_id', 'channel_id')
             )
+            stream_ids = list(dict.fromkeys(sid for sid, _cid in assignments))
+            channel_by_stream = {}
+            for sid, cid in assignments:
+                channel_by_stream.setdefault(sid, cid)
             if not stream_ids:
                 return {"status": "success", "message": "No streams assigned to enabled channels."}
 
@@ -9510,8 +9630,12 @@ class Plugin:
 
                 last_probe_started = time.time()
                 logger.debug(f"[Stream-Mapparr] Probing stream {stream['id']} (account={acct_id})")
+                user_agent = ua_by_account.get(acct_id)
+                source_command = self._stream_profile_command(
+                    stream, channel_by_stream.get(stream['id']), user_agent, logger
+                )
                 mbps, edge = self._probe_stream_throughput(
-                    url, duration_s, ua_by_account.get(acct_id), logger
+                    url, duration_s, user_agent, logger, source_command=source_command
                 )
                 next_eligible[acct_id] = time.time() + account_delay
 
